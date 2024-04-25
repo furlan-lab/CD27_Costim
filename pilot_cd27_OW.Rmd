@@ -1,0 +1,2393 @@
+---
+title: "Load MO"
+author: "OW"
+date: "10/15/21"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=F}
+graphics.off()
+rm(list=ls())
+knitr::opts_chunk$set(fig.width=8, fig.height=6,dpi=300,
+                      echo=FALSE, warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(dev.args=list(bg="transparent"))
+ROOT_DIR<-"/fh/fast/furlan_s/grp/experiments"
+stem<-"pilot_cd27"
+DATA_DIR <- file.path(ROOT_DIR,  stem, "data")      # SPECIFY HERE
+RES_DIR  <- file.path(ROOT_DIR,  stem, "res")     # SPECIFY HERE
+RMD_DIR  <- file.path(ROOT_DIR,  stem, "rmd")     # SPECIFY HERE
+CDS_DIR <- file.path(ROOT_DIR,  stem, "cds")
+FIG_DIR <- file.path(ROOT_DIR,  stem, "figs")
+
+suppressPackageStartupMessages({
+  library(monocle3)
+  library(reticulate)
+  library(openxlsx)  
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(xfun)
+  library(pals)
+  library(RColorBrewer)
+  library(Signac)
+  library(Seurat)
+  library(ggplot2)
+  library(future)
+  library(GenomicRanges)
+  library(viridis)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(EnsDb.Hsapiens.v86)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(JASPAR2020)
+  library(TFBSTools)
+  library(patchwork)
+  library(stringr)
+  library(ggsignif)
+  library(ggpubr)
+  library(ggplot2)
+  library(ggrastr)
+  library(BuenColors)
+  library(FigR)
+  library(ggrepel)
+  library(fgsea)
+  library(ArchR)
+  library(parallel)
+  library(scCustomize)
+  library(pbmcapply)
+  library(FigR)
+})
+
+set.seed(1234)
+
+h_cols <-rev(brewer.pal(name = "RdYlBu", n = 7)) 
+
+MO<-readRDS( file.path(CDS_DIR, "MO_pilot_cd27.rds"))
+
+fig.d<-read.csv(file.path(RES_DIR, "stim_figR_cd27.csv"))
+
+options(bitmapType = 'cairo')
+
+
+Sys.setenv(MODULEPATH="/app/modules/all", MODULEPATH_ROOT="/app/modules/all", MODULESHOME="/app/lmod/lmod")
+source("/app/lmod/lmod/init/R", echo=FALSE, max=Inf)
+module("load", "MACS2/2.2.6-foss-2019b-Python-3.7.4")
+
+
+library(future)
+library(parallel)
+plan("multisession", workers = detectCores())
+options(future.globals.maxSize = 700000 * 1024 ^ 3) # for 240 Gb RAM
+
+dyn.load('/app/software/ArrayFire/3.8.1/lib64/libaf.so.3')
+
+library(RcppArrayFire)
+library(viewmaster)
+```
+
+#no need to run
+```{bash}
+ssh owaltner@rhino
+cd /fh/scratch/delete90/furlan_s/pilot_cd27/pilot_cd27/outs
+ml MACS2
+mkdir peaks
+outdir=peaks
+macs2 callpeak -t atac_fragments.tsv.gz -g 2.7e+09 -f BED --nomodel --extsize 200 --shift -100 -n macs2 --outdir $outdir
+```
+
+
+#Make object start
+```{r Make Seurat object Using MACS2 output}
+samps<-c("pilot_cd27")   
+
+peaks <- read.table(file = file.path(DATA_DIR, samps, "outs/peaks/macs2_peaks.narrowPeak"))
+colnames(peaks)<-c("chr start end name integer_score none fold_enrichment log10pvalue log10qvalue relative_summit_pos") %>%strsplit(" ") %>% unlist()
+
+
+macs_granges<-makeGRangesFromDataFrame(peaks)
+
+peakwidths <- width(macs_granges)
+macs_mo.peaks <- macs_granges[peakwidths  < 10000 & peakwidths > 20]
+macs_mo.peaks <- keepStandardChromosomes(macs_mo.peaks, pruning.mode = "coarse")
+
+tab<-read.table(
+  file = file.path(DATA_DIR, samps, "outs/per_barcode_metrics.csv"),
+  stringsAsFactors = FALSE,
+  sep = ",",
+  header = TRUE,
+  row.names = 1
+)
+
+table(tab$is_cell)
+
+meta<-  tab[tab$is_cell!=0, ]
+
+
+frags<-
+  CreateFragmentObject(
+  path = file.path(DATA_DIR, samps, "outs/atac_fragments.tsv.gz"),
+  cells = meta$gex_barcode)
+
+##you might need to change the frag path to where ^^ atac_fragments.tsv.gz is
+#run this first 
+frags@path
+
+
+# frags<-lapply(frags, function(frag){
+#   frag@path<-gsub("/Users/owaltner/Fred Hutchinson Cancer Research Center/Myeloma Exhaustion - General/allo1/data", DATA_DIR, frag@path )
+#   frag
+# })
+
+cts<-
+  FeatureMatrix(
+    fragments = frags, process_n = 5000,
+    features = macs_mo.peaks,
+    cells = rownames(meta))
+
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+
+# change to UCSC style 
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+
+#run this if 'annotations' is not in chr1- format
+annotations@seqnames@values <- paste0("chr", annotations@seqnames@values)
+
+
+raw<-Read10X_h5(file.path(DATA_DIR, samps, "outs/raw_feature_bc_matrix.h5"))
+seu<-CreateSeuratObject(
+  counts = raw$`Gene Expression`[,colnames(cts)], assay= "RNA", meta.data = meta)
+
+seu[["ATAC"]]<-CreateChromatinAssay(cts, fragments = frags, sep = c(":", "-"), annotation = annotations)
+seu$dataset<-samps
+
+#saveRDS(seu, file.path(CDS_DIR, "pilot_cd27_unfiltered.rds"))
+mo<-seu
+mo<-readRDS(file.path(CDS_DIR, "pilot_cd27_unfiltered.rds"))
+```
+## QC
+```{r RNA/ATAC QC}
+DefaultAssay(mo) <- "ATAC"
+mo$Frip<-mo$atac_peak_region_fragments/mo$atac_fragments
+mo$log_ATAC<-log10(mo$nCount_ATAC)
+
+# compute TSS enrichment score per cell
+mo<- TSSEnrichment(object = mo, fast = F)
+mo <- NucleosomeSignal(mo)
+
+DefaultAssay(mo) <- "RNA"
+mo[["percent.mt"]] <- PercentageFeatureSet(mo, pattern = "^MT-")
+mo$log_RNA<-log10(mo$nCount_RNA)
+
+VlnPlot(mo, features =  c("TSS.enrichment", "nucleosome_signal", "TSS.percentile", "Frip", "percent.mt", "log_ATAC", "log_RNA"), group.by = "dataset", pt.size = 0)
+
+#get an extra set of eyes before setting parameters, it should be similar to the ones below tho
+
+t<- subset(
+  x = mo,
+  subset = 
+    nucleosome_signal < 1.5 &
+    TSS.enrichment > 1&
+    percent.mt <= 15 &
+    log_ATAC >= 3 &
+    log_RNA >= 2 &
+    log_ATAC <= 5 &
+    log_RNA <= 4.5 &
+    Frip >= .4
+)
+MO<-t
+
+saveRDS(t,file.path(CDS_DIR, "pilot_cd27_filtered.rds"))
+```
+
+```{r pbmc/MO SCT}
+library(glmGamPoi)
+
+MO<-readRDS(file.path(CDS_DIR, "pilot_cd27_filtered.rds"))
+#saveRDS(MO, file.path(CDS_DIR, "MO_pilot_cd27.rds"))
+```
+
+```{r pbmc/MO SCT}
+MO<-FindVariableFeatures(MO)
+MO<-ScaleData(MO)
+MO <- SCTransform(MO, method = "glmGamPoi", vars.to.regress = "percent.mt")
+MO <- RunPCA(MO, features = VariableFeatures(MO))
+ElbowPlot(MO)
+ElbowPlot(MO, ndims = 30)
+MO<-RunUMAP(MO, dims = 1:10, verbose = T, reduction.name = "SCT_UMAP") 
+
+# DimPlot(MO, group.by = "group",reduction = "SCT_UMAP")
+```
+#HTO ## rerun the citeseq count HTO1 cellranger and change cell input from 10k to 200k
+```{r}
+path<-"../data/HTO_count2/umi_count"
+
+counts<-readMM(file.path(path, "matrix.mtx.gz")) ## to read sparse matrix file use MM
+colnames(counts)<-data.table::fread(file.path(path, "barcodes.tsv.gz"), header = F)$V1
+rownames(counts)<-data.table::fread(file.path(path, "features.tsv.gz"), header = F)$V1
+
+table(Cells(MO) %in% paste0(colnames(counts), "-1")) ## didnt work, lot of cells in MO dont have HTO counts(didnt 
+colnames(counts)<-paste0(colnames(counts), "-1")
+
+
+MO[["HTO"]]<-CreateAssayObject(counts[1:3,match(Cells(MO), colnames(counts))])
+MO <- NormalizeData(MO, assay = "HTO", normalization.method = "CLR")
+MO <- HTODemux(MO, assay = "HTO", positive.quantile = 0.99)
+table(MO$HTO_classification.global)
+Idents(MO) <- "HTO_maxID"
+RidgePlot(MO, assay = "HTO", features = rownames(MO[["HTO"]])[1:3], ncol = 3)
+Idents(MO) <- "HTO_classification.global"
+VlnPlot(MO, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+DimPlot(MO, group.by = "HTO_classification")
+```
+
+## subset and remove doublet HTO hashes from MO object
+```{r}
+MO$HTO_classification[grepl("_", MO$HTO_classification)]<-"Doublet"
+MO<-MO[,!MO$HTO_classification %in% c("Doublet")]
+table(MO$HTO_classification.global)
+#subset out low quality 24hr bead cells
+
+MO$group <- MO$HTO_maxID
+table(MO$group)
+
+DefaultAssay(MO)<-"HTO"
+MO$group[which(MO$group=="HT6-GGTTGCCAGATGTCA")]<-"Naive"
+MO$group[which(MO$group=="HT7-TGTCTTTCCTGCCAG")]<-"24hr_Beads"
+MO$group[which(MO$group=="HT8-CTCCTCTGCAATTAC")]<-"24hr_3/27"
+
+MO$group<-factor(MO$group, levels=c("Naive", "24hr_3/27", "24hr_Beads"))
+
+VlnPlot(MO, features = c("log_ATAC", "log_RNA"), group.by = "group")
+
+rm_24hr<-colnames(MO)[which(MO$group == "24hr_Beads" & MO$log_RNA < 3.5)]
+rm_naive_27<-colnames(MO)[which(MO$group != "24hr_Beads" & MO$log_RNA < 2.7)]
+rm_atac<-colnames(MO)[which(MO$log_ATAC < 3.5)]
+
+sub<-MO[,colnames(MO)[which(!colnames(MO) %in% c(rm_24hr, rm_naive_27, rm_atac))]]
+
+MO<-sub
+```
+
+#Reduce dims 
+```{r MO ATAC}
+DefaultAssay(MO) <- "ATAC"
+MO <- RunTFIDF(MO)
+MO <- FindTopFeatures(MO, min.cutoff = 'q0')
+MO<- RunSVD(MO)
+ElbowPlot(MO)
+ElbowPlot(MO, ndims = 30)
+MO<- RunUMAP(MO, reduction = 'lsi', dims = 2:20, reduction.name = "ATAC_UMAP")
+DimPlot(MO,  group.by ="group", label=T, reduction = "ATAC_UMAP")+ggtitle("ATAC UMAP")
+```
+
+```{r MO SCT}
+MO<-FindVariableFeatures(MO)
+MO<-ScaleData(MO)
+MO <- SCTransform(MO, method = "glmGamPoi", vars.to.regress = "percent.mt")
+MO <- RunPCA(MO, features = VariableFeatures(MO))
+ElbowPlot(MO)
+ElbowPlot(MO, ndims = 30)
+MO<-RunUMAP(MO, dims = 1:20, verbose = T, reduction.name = "SCT_UMAP") 
+DimPlot(MO,  group.by ="group", label=T, reduction = "SCT_UMAP")+ggtitle("SCT UMAP")
+library(harmony)
+MO<- RunHarmony(
+  object = MO,
+  group.by.vars = 'group',
+  reduction = 'pca',
+  assay.use = 'SCT',
+  project.dim = FALSE
+)
+
+MO <- RunUMAP(MO, dims = 1:20, reduction = 'harmony')
+DimPlot(MO, group.by = "group", label=T, reduction = "umap")+ggtitle("Harmony integration")
+```
+
+```{r mo WNN}
+MO <- FindMultiModalNeighbors(MO, reduction.list = list("harmony", "lsi"), dims.list = list(1:10, 2:15), weighted.nn.name = "wnn.nn")
+
+MO<- RunUMAP(MO, nn.name = "wnn.nn", assay = "ATAC" , reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+
+DimPlot(MO, group.by = "group", reduction = "wnn.umap", label = T)+ggtitle("WNN HARMONY UMAP")
+
+#get rid of satellite cells
+t<-MO
+cells<-CellSelector(DimPlot(t, reduction = "wnn.umap"), t)
+# write.csv(cells, file = "../res/cells.csv")
+cells<-read.csv("../res/cells.csv")
+t<-t[,which(colnames(t) %in% cells$x)]
+
+t <- FindMultiModalNeighbors(t, reduction.list = list("harmony", "lsi"), dims.list = list(1:15, 2:20), weighted.nn.name = "wnn.nn")
+
+t<- RunUMAP(t, nn.name = "wnn.nn", assay = "ATAC" , reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+
+DimPlot(t, group.by = "group", reduction = "wnn.umap", label = T)+ggtitle("WNN HARMONY UMAP")
+```
+
+#Add metadata
+```{r Cluster and collapse}
+DefaultAssay(MO)<-"SCT"
+MO <- FindClusters(MO, resolution = 1.1, graph.name = "wsnn", random.seed = 123, algorithm = 3)##0.5 is the default resolution, if you increase the number, you will get more cluster
+
+
+DimPlot(MO, group.by = "seurat_clusters", reduction = "wnn.umap", label = F, cols =  ArchR::paletteDiscrete(values = levels(factor(MO$seurat_clusters)), set = "stallion2"))+ggtitle("Seurat clusters")&NoAxes()
+
+Idents(MO)<-"seurat_clusters"
+MO.markers <- FindAllMarkers(MO, only.pos = FALSE,  logfc.threshold = 0.25)
+
+top_n<- MO.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 8, order_by = avg_log2FC)
+
+MO$clusters<-as.character(MO$seurat_clusters)
+MO$clusters[MO$clusters %in% c(7)]<-"Naive"
+MO$clusters[MO$clusters %in% c(2)]<-"Naive"
+MO$clusters[MO$clusters %in% c(3,5)]<-"Naive"
+MO$clusters[MO$clusters %in% c(1,4)]<-"CD27_IKZF2-"
+MO$clusters[MO$clusters %in% c(8)]<-"CD27_IKZF2+"
+MO$clusters[MO$clusters %in% c(9)]<-"intermediate_cells"
+MO$clusters[MO$clusters %in% c(6)]<-"Bead_IL2+"
+MO$clusters[MO$clusters %in% c(0)]<-"Bead_IL2-"
+
+MO$clusters<-factor(MO$clusters, levels = c("Naive", "intermediate_cells", "CD27_IKZF2+", "CD27_IKZF2-", "Bead_IL2-", "Bead_IL2+"))
+MO$group<-factor(MO$group, levels = c("Naive", "24hr_3/27", "24hr_Beads"))
+DimPlot(MO, group.by = "clusters", reduction = "wnn.umap")
+```
+
+#add other assays
+```{r Gene Activity}
+DefaultAssay(MO)<- "ATAC"
+MO@assays[["ATAC"]]@fragments[[1]]@path<-gsub(MO@assays[["ATAC"]]@fragments[[1]]@path, "/fh/fast/furlan_s/grp/experiments/pilot_cd27/data/pilot_cd27/outs/atac_fragments.tsv.gz", MO@assays[["ATAC"]]@fragments[[1]]@path )
+
+gene.activities <- GeneActivity(MO)
+
+MO[['GENE_ACC']] <- CreateAssayObject(counts = gene.activities)
+MO <- NormalizeData(
+  object = MO,
+  assay = 'GENE_ACC',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(MO$nCount_GENE_ACC)
+)
+DefaultAssay(MO)<- "GENE_ACC"
+MO<-ScaleData(MO)
+```
+
+```{r Add Motifs}
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# add motif information
+MO <- AddMotifs(
+  object = MO,
+  genome =BSgenome.Hsapiens.UCSC.hg38,
+  pfm = pfm
+)
+rownames(MO[["chromvar"]])
+
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+library(Signac)
+DefaultAssay(MO)<-"ATAC"
+
+MO@assays$ATAC@motifs<-NULL
+MO <- AddMotifs(
+  object = MO,
+  genome =BSgenome.Hsapiens.UCSC.hg38,
+  pfm = human_pwms_v3
+)
+```
+
+```{r Run ChromVAR}
+MO <- RunChromVAR(
+  object = MO,
+  genome = BSgenome.Hsapiens.UCSC.hg38
+)
+rownames(MO@assays$chromvar)
+```
+
+```{r reset levels to clusters}
+MO$group<-factor(MO$group, levels = c("Naive", "24hr_3/27", "24hr_Beads"))
+```
+
+```{r save final RDS}
+saveRDS(MO, file.path(CDS_DIR, "MO_pilot_cd27.rds"))
+```
+
+
+#Dim Plots
+```{r dim plots}
+q<-DimPlot(MO, group.by = "clusters", reduction = "wnn.umap", label = F, cols = c("Naive"= "gray70", "Bead_IL2-" = "#8B0000",  "Bead_IL2+" = "#F08080", "CD27_IKZF2-" = "#008080",  "CD27_IKZF2+" = "#00CED1", "intermediate_cells" = "#191970"), pt.size = 1)+ggtitle("Seurat clusters")&NoAxes()
+q
+
+DimPlot(MO, group.by = "group", reduction = "wnn.umap", label = F, cols = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))+ggtitle("group")&NoAxes()
+
+DefaultAssay(MO)<-"HTO"
+FeaturePlot(MO, features = rownames(MO), reduction = "wnn.umap")
+
+cds<-seurat_to_monocle3(MO, seu_rd = "wnn.umap")
+svglite::svglite("umap_clusters.svg", width = 4, height = 3)
+plot_cells(cds, color_cells_by = "clusters", cell_size = 0.7, label_cell_groups = F)+scale_color_manual(values = c("Naive"= "gray70", "Bead_IL2-" = "#8B0000",  "Bead_IL2+" = "#F08080", "CD27_IKZF2-" = "#008080",  "CD27_IKZF2+" = "#00CED1", "intermediate_cells" = "#191970"))&NoAxes()
+dev.off()
+```
+
+#QC plots
+```{r MO QC stats}
+VlnPlot(
+  object = MO,
+  features = c("log_RNA", "percent.mt", "log_ATAC", "TSS.enrichment", "nucleosome_signal", "Frip"),
+  group.by = "group",
+  ncol = 3,
+  pt.size = 0,
+  cols =c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))   ## for pretty colors
+```
+
+```{r}
+table(MO$clusters)
+sub<-MO@meta.data[MO$clusters == "intermediate_cells",]
+
+df<-data.frame(table(sub$group))
+
+p<-ggplot(df, aes(fill = Var1, y=Freq, x=Var1)) + 
+    geom_bar(stat = "identity")+scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))+theme_classic()+RotatedAxis()+NoGrid()
+p
+```
+
+#Find Marker Genes
+```{r Find markers cluster}
+DefaultAssay(MO)<- "SCT" 
+Idents(MO)<-"clusters"
+
+MO.markers <- FindAllMarkers(MO, only.pos = FALSE,  logfc.threshold = 0.25)
+
+top_n<- MO.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 12, order_by = avg_log2FC)
+```
+
+```{r top 15 genes per cluster}
+svglite::svglite("../figs/cluster_dot_plot.svg", width = 15.5, height = 2.5)
+DotPlot(MO, features = unique(top_n$gene), group.by = "clusters", cluster.idents=F)+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))&RotatedAxis()
+dev.off()
+```
+
+#Feature plots for figure
+```{r Feature plots}
+DefaultAssay(MO)<-"SCT"
+
+FeaturePlot(MO, features = c("CD27"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("TCF7"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("SELL"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("LEF1"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("MYBL2"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("CXXC5"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("IL2"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("IL2RA"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+FeaturePlot(MO, features = c("FOXP1"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = c("ELF2"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("ETS1"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("ELF1"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("FOXO1"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("CTCF"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("MYC"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("STAT5B"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17"))&NoAxes()
+FeaturePlot_scCustom(MO, features = c("PRDM1"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17") )&NoAxes()
+FeaturePlot_scCustom(MO, features = c("EOMES"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17") )&NoAxes()
+FeaturePlot_scCustom(MO, features = c("STAT1"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17") )&NoAxes()
+FeaturePlot_scCustom(MO, features = c("STAT2"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17") )&NoAxes()
+FeaturePlot_scCustom(MO, features = c("TBX1"), reduction = "wnn.umap", order = T, max.cutoff= "q90", colors_use = c( "gray85","#04578f", "#fffb17") )&NoAxes()
+```
+
+```{r Feature Plots Metabolic markers: HIF1A, NRF2, HK2, PFKM, SQSTM1}
+DefaultAssay(MO)<-"SCT"
+DotPlot(MO, features = c("HIF1A","NR2F2","HK2","PFKM","SQSTM1"), group.by = "clusters", cluster.idents = F, scale.by = "size", scale.min = NA, scale.max = NA) +theme(axis.text.x=element_text(size=9), axis.text.y=element_text(size=9))+coord_flip() +xlab("Gene") + ylab("clusters")+RotatedAxis()+ggtitle("Metabolic markers")+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+
+FeaturePlot(MO, features = "SQSTM1", reduction = "wnn.umap", order = T)+scale_color_gradientn(colors = c("gray90", "#04578f", "#801b1b"))
+```
+
+```{r Proliferation: CDKN1A, MKI67,}
+FeaturePlot(MO, features = "CDKN1A", reduction = "wnn.umap", order = T)+scale_color_gradientn(colors = c("gray90", "#04578f", "#801b1b"))
+FeaturePlot(MO, features = "MKI67", reduction = "wnn.umap", order = T)+scale_color_gradientn(colors = c("gray90", "#04578f", "#801b1b"))
+```
+
+```{r TF regulation: Bach1, TCF1, TCF4, LEF1, NCOA7, ID3, BCL11A, NFATC1, NFATC2, PRMT2}
+DefaultAssay(MO)<-"SCT"
+DotPlot(MO, features = c("BACH1","TCF7","LEF1","NCOA7","ID3","PRMT2", "TXNIP", "ID2", "CCR7", "IL7R", "BACH2", "SELL"), group.by = "clusters", cluster.idents = F, scale.by = "size", scale.min = NA, scale.max = NA) +theme(axis.text.x=element_text(size=9), axis.text.y=element_text(size=9)) +xlab("Gene") + ylab("clusters")+RotatedAxis()+coord_flip()+scale_color_gradientn(colors = c("gray90", "#04578f", "#801b1b"))
+
+
+FeaturePlot_scCustom(MO, features = "ID3", reduction = "wnn.umap", max.cutoff = "q99")
+```
+
+```{r from Bulk heatmap}
+DotPlot(MO, assay = "SCT", features = c("RALB","FURIN","BCL3","HIST1H1D","TNFSF12","TNFSF10","ULBP2", "MYB", "STAT1", "CDKN1A","CYP1A1","CD40LG","PFKM","IFNG","IL2","BIRC3","IRF7","CORO2A","TXNIP","CXCR4","RASGRP2"), group.by = "clusters", cluster.idents = F, scale.by = "size", scale.min = NA, scale.max = NA) +theme(axis.text.x=element_text(size=9), axis.text.y=element_text(size=9)) +xlab("Gene") + ylab("Exp group")+RotatedAxis()+ggtitle("Bulk markers")+coord_flip()+scale_color_gradientn(colors = c("gray90", "#04578f", "#801b1b"))
+```
+
+#DA Motifs
+```{r DA motifs across exp groups DOT PLOT }
+Idents(MO)<-"group"
+differential.activity <- FindAllMarkers(
+  object = MO,
+  only.pos = T,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff"
+)
+
+t<- c()
+for(i in 1:length(differential.activity$gene)){
+  t[i]<-MO@assays$ATAC@motifs@motif.names[[differential.activity$gene[i]]]
+}
+differential.activity$TF <- t
+
+#write.csv(differential.activity, file.path(RES_DIR, "TF_enrichments_group_jaspar.csv"))
+
+differential.activity<-read.csv(file.path(RES_DIR, "TF_enrichments_group_jaspar.csv"))
+
+table(differential.activity$cluster)
+
+differential.activity<-read.csv(file.path(RES_DIR, "TF_enrichments_group_cisbp.csv"))
+
+
+#select significant TFS
+top_tf<- differential.activity %>%
+    dplyr::group_by(cluster) %>%
+    slice_max(avg_diff, n = 15)
+dim(top_tf)
+
+#get unique pathways
+#get values from other groups of top pathways
+all_values<- differential.activity[which(differential.activity$TF %in% c(top_tf$TF)),]
+
+all_values$cluster<-factor(all_values$cluster, levels = c("Naive", "24hr_3/27", "24hr_Beads"))
+all_values<-all_values %>% mutate(cluster=factor(cluster, levels=c("Naive", "24hr_3/27", "24hr_Beads"))) 
+all_values<-all_values %>% arrange(cluster, desc(avg_diff))
+all_values$TF<-factor(all_values$TF, levels =rev(unique(all_values$TF)))
+
+##all tfs
+#all_values$TF<-factor(all_values$TF, levels = levels(all_values$TF)[c(1:27, 43:47, 28:42)])
+all_values$TF<-factor(all_values$TF, levels = levels(all_values$TF)[c(10:26, 1:9,27:47)])
+
+ggplot(data = all_values, aes(x = cluster, y = TF)) +
+geom_point(aes(size = pct.1, fill = avg_diff), alpha = 0.75, shape = 21) +theme_bw()+NoGrid()+scale_fill_gradientn(colors = viridis(n=100))+RotatedAxis()
+```
+
+```{r DA motifs across exp groups DOT PLOT per group}
+tfs<-levels(all_values$TF)
+
+bead<-all_values[all_values$TF %in% tfs[1:15],]  %>% arrange(desc(avg_diff))
+bead$TF<-factor(bead$TF, levels = rev(unique(bead$TF)))
+
+c27<-all_values[all_values$TF %in% tfs[c(16:30)],]%>% arrange(desc(avg_diff))
+c27$TF<-factor(c27$TF, levels = rev(unique(c27$TF)))
+
+naive<-all_values[all_values$TF %in% tfs[31:45],]%>% arrange(desc(avg_diff))
+naive$TF<-factor(naive$TF, levels = rev(unique(naive$TF)))
+
+dim(naive)
+dim(c27)
+dim(bead)
+
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "STAT1", reduction = "wnn.umap")
+
+pdf("../figs/Motif data/Split versions_cisbp/naive_motf_acc_dot_plot.pdf", width = 2.75, height = 4.5)
+ggplot(data = naive, aes(x = cluster, y = TF)) +
+geom_point(aes(size = pct.1, fill = avg_diff), alpha = 0.75, shape = 21) +theme_bw()+NoGrid()+scale_fill_gradientn(colors = viridis(n=100))+RotatedAxis()
+dev.off()
+
+pdf("../figs/Motif data/Split versions_cisbp/cd27_motf_acc_dot_plot.pdf", width = 2.75, height = 4.5)
+ggplot(data = c27, aes(x = cluster, y = TF)) +
+geom_point(aes(size = pct.1, fill = avg_diff), alpha = 0.75, shape = 21) +theme_bw()+NoGrid()+scale_fill_gradientn(colors = viridis(n=100))+RotatedAxis()
+dev.off()
+
+pdf("../figs/Motif data/Split versions_cisbp/bead_motf_acc_dot_plot.pdf", width = 2.75, height = 4.5)
+ggplot(data = bead, aes(x = cluster, y = TF)) +
+geom_point(aes(size = pct.1, fill = avg_diff), alpha = 0.75, shape = 21) +theme_bw()+NoGrid()+scale_fill_gradientn(colors = viridis(n=100))+RotatedAxis()
+dev.off()
+```
+#Plot high accessibility in beads vs others
+```{r}
+VlnPlot(MO, group.by = "group",  features = "log_ATAC", cols =c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"), pt.size = 0)
+
+atac_mat<-MO@assays$ATAC@counts %>% as.matrix()
+
+dim(atac_mat)
+FindTopFeatures(MO, min.cutoff = 'q0') %>% TopFeatures()
+
+atac_mat <-atac_mat[MO@assays$ATAC@var.features,]%>% as.matrix()
+dim(atac_mat)
+
+atac_mat[atac_mat > 0]<-1
+
+colr = colorRamp2(
+        seq(min(atac_mat), max(atac_mat), length = 2),
+        c("white", "black"),
+        space = "RGB")
+
+group = MO$group
+names(group) = colnames(MO)
+
+column_ha = HeatmapAnnotation(
+    group = MO$group, 
+    col = list(group = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red")),
+    annotation_name_gp= gpar(fontsize = 25),
+    #border = T,
+    annotation_legend_param = list(
+        group = list(
+            title = "group", 
+            title_gp = gpar(fontsize = 25),
+            labels_gp = gpar(fontsize = 20),
+            border = T
+        )
+    )
+)
+
+# atac_mat<-AverageExpression(MO, assays = "ATAC", group.by = "group")
+
+pdf(file.path(FIG_DIR, "Global Accessibility", "atac_heatmap_group.pdf"), width =6, height = 6)
+ht = Heatmap(
+    atac_mat,
+    col= colr,
+    use_raster = F,
+    
+    #anno
+    top_annotation = column_ha,
+    
+    #legend
+    name = "Binarized\ncounts",
+    heatmap_legend_param = list(
+        color_bar = "discrete",
+        title_gp = gpar(fontsize = 25),
+        labels_gp = gpar(fontsize = 20),
+        at = 0:1,
+        border = T
+    ),
+    
+    #labels
+    show_column_names = FALSE,
+    show_row_names = FALSE,
+    column_title = "", 
+    row_title = "Top 2000 peaks",
+    row_title_gp = gpar(fontsize = 25),
+    border = TRUE,
+    show_row_dend = F,
+    
+    #clustering
+    clustering_distance_rows= "pearson",
+    clustering_distance_columns= "pearson",
+    clustering_method_rows = "ward.D2" ,
+    clustering_method_columns="ward.D2",
+    cluster_columns = cluster_within_group(atac_mat,group)
+)
+ht
+dev.off()
+```
+
+
+
+#Footprinting
+```{r footprinting}
+DefaultAssay(MO)<-"ATAC"
+unique(sub$Motif) %in% rownames(MO) 
+MO <- Footprint(
+  object = MO,
+  motif.name = unique(sub$Motif),
+  genome = BSgenome.Hsapiens.UCSC.hg38
+)
+DefaultAssay(MO)<-"ATAC"
+
+lapply( 1:length(unique(sub$Motif)), function(x){
+  
+  pdf(file.path(FIG_DIR, "Footprints",paste0(unique(sub$Motif)[x],"_footprints.pdf")), width =4, height =4)
+  print(PlotFootprint(MO , features = unique(sub$Motif)[x],group.by = "group", normalization = "divide")&scale_color_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(legend.position = "none"))
+  dev.off()
+  
+})
+```
+
+#Link Peaks / Coverage Plots
+```{r Coverage Plots}
+DefaultAssay(MO)<-"ATAC"
+MO<-LinkPeaks(MO, peak.assay = "ATAC", expression.assay = "SCT", genes.use = c("IFNG", "IL2", "IL2RA", "IL2RB", "TCF7", "LEF1", "IL7R", "CCR7", "FOXO1", "FOXP1", "IKZF1", "IKZF2", "ATF2", "TNF", "INFA1", "TGFB1", "IL6", "STAT1", "TIGIT"))
+```
+
+```{r Coverage Plots}
+DefaultAssay(MO)<-"ATAC"
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/ifng.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IFNG", group.by = "group", links= T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+svglite::svglite("../figs/Coverage_plots_OW/ifng_linked.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IFNG", group.by = "group", links= T, extend.upstream = 50000, extend.downstream = 50000)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/il2.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IL2", group.by = "group", extend.downstream = 30000, extend.upstream = 3000 , expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "IL2")
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/il2_linked.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IL2", group.by = "group", extend.downstream = 30000, extend.upstream = 300000 , expression.assay = "SCT", links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/il2ra.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IL2RA", group.by = "group", extend.downstream =20000, extend.upstream = 3000 , expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/il2rb.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IL2RB", group.by = "group",extend.downstream =200, extend.upstream = 200 , links =F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/Tcf7.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "TCF7", group.by = "group",extend.downstream =2000, extend.upstream = 50000 , links =F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "TCF7")
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/Tcf7_linked.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "TCF7", group.by = "group",extend.downstream =500000, extend.upstream = 50000 , links =T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "LEF1")
+
+# SVG graphics device
+svglite::svglite("../figs/Coverage_plots_OW/lef1_linked.svg", pointsize = 20, width = 7, height = 4)
+# Code of the plot
+plot(CoveragePlot(MO, region = "LEF1", group.by = "group", extend.downstream =50000, extend.upstream = 250000 , links =T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10)))
+# Close the graphics device
+dev.off() 
+
+svglite::svglite("../figs/Coverage_plots_OW/il7r.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "IL7R", group.by = "group", extend.downstream = 50000, extend.upstream = 75000, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+svglite::svglite("../figs/Coverage_plots_OW/ccr7.svg", pointsize = 20, width = 5, height = 4)
+CoveragePlot(MO, region = "CCR7",  group.by = "group", extend.downstream = 10000, extend.upstream = 50000, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "FOXO1")
+svglite::svglite("../figs/Coverage_plots_OW/foxo1_linked.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "FOXO1", group.by = "group", extend.downstream = 400000, extend.upstream =5000 , links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+
+GetLinkedPeaks(MO, features = "FOXP1")
+svglite::svglite("../figs/Coverage_plots_OW/foxp1_linked.svg", pointsize = 20, width = 7, height = 4)
+CoveragePlot(MO, region = "chr3-71083549-71983021", group.by = "group", extend.downstream = 10000, extend.upstream = 10000,links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+svglite::svglite("../figs/Coverage_plots_OW/ikzf1.svg", pointsize = 20, width =5, height = 4)
+CoveragePlot(MO, region = "IKZF1",group.by = "group", extend.downstream = 500, extend.upstream = 500, links = F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+svglite::svglite("../figs/Coverage_plots_OW/ikzf2.svg", pointsize = 20, width =5, height = 4)
+CoveragePlot(MO, region = "IKZF2",group.by = "group", extend.downstream = 2000, extend.upstream = 2000, links = T, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+dev.off() 
+
+svglite::svglite("../figs/Coverage_plots_OW/atf2.svg", pointsize = 20, width = 5, height = 4)
+CoveragePlot(MO, region = "ATF2", group.by = "group", extend.downstream = 10000, extend.upstream = 500000, links = T, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "IL6")
+pdf("../figs/Coverage_plots_OW/il6.pdf", width = 5, height = 4)
+CoveragePlot(MO, region = "IL6", group.by = "group", extend.downstream = 10000, extend.upstream = 500000, links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "STAT1")
+pdf("../figs/Coverage_plots_OW/stat1.pdf",width = 5, height = 4)
+CoveragePlot(MO, region = "chr2-190648011-191207095", group.by = "group", extend.downstream = 50000, extend.upstream = 90000, links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "TNF")
+pdf("../figs/Coverage_plots_OW/TNFA.pdf", width = 5, height = 4)
+CoveragePlot(MO, region = "chr6-31826619-31827949", group.by = "group", extend.downstream = 5000, extend.upstream = 300000 , links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+DefaultAssay(MO)<-"RNA"
+FeaturePlot(MO, features = "TGFB1")
+
+rownames(MO)
+
+GetLinkedPeaks(MO, features = "TGFB1")
+pdf("../figs/Coverage_plots_OW/TGFB1.pdf", width = 5, height = 4)
+CoveragePlot(MO, region = "TGFB1", group.by = "group", extend.downstream = 5000, extend.upstream = 50000 , links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+GetLinkedPeaks(MO, features = "TIGIT")
+pdf("../figs/Coverage_plots_OW/TGFB1.pdf", width = 5, height = 4)
+CoveragePlot(MO, region = "chr3-114307302-114324214", group.by = "group", extend.downstream = 5000, extend.upstream = 50000 , links = T)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+dev.off() 
+
+DefaultAssay(MO)<-"RNA"
+FeaturePlot(MO, features = "TIGIT", reduction = "wnn.umap")
+```
+
+#FigR
+```{r helper functions}
+gAll <- ggplot(fig.d ,aes(Corr.log10P,Enrichment.log10P,color=Score, label = Motif)) + 
+  geom_point(size=0.01,shape=16) +
+  theme_classic() +
+  ylim(c(-3.5,6))+
+  theme(axis.text = element_text(size = 10), axis.title = element_text(size = 15))+
+  scale_color_gradientn(colours =  c("#5E4FA2", "#3288BD" ,"#66C2A5", "#ABDDA4"  ,"gray80", "#FDAE61", "#F46D43", "#D53E4F" ,"#9E0142"),limits=c(-2.5,2.5),oob = scales::squish)
+#+geom_text_repel(data = stim_FigR[stim_FigR$Score > 1.543729 |stim_FigR$Score < -1.65  ,], size =5, max.overlaps = 15)
+
+
+
+plotfigRHeatmap<-function (figR.d, score.cut = 1, DORCs = NULL, TFs = NULL, ...) 
+{
+    message("Using absolute score cut-off of: ", score.cut, " ..\n")
+    DORCsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut) %>% 
+        pull(DORC) %>% unique()
+    TFsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut) %>% 
+        pull(Motif) %>% unique()
+    if (!is.null(DORCs)) {
+        if (!all(DORCs %in% figR.d$DORC)) 
+            stop("One or more DORCs specified is not a valid DORC symbol found in the data.frame")
+        DORCsToKeep <- intersect(DORCsToKeep, DORCs)
+        TFsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= score.cut & 
+            DORC %in% DORCsToKeep) %>% pull(Motif) %>% unique()
+    }
+    if (!is.null(TFs)) {
+        if (!all(TFs %in% figR.d$Motif)) 
+            stop("One or more TFs specified is not a valid TF symbol found in the data.frame")
+        TFsToKeep <- intersect(TFsToKeep, TFs)
+        DORCsToKeep <- figR.d %>% dplyr::filter(abs(Score) >= 
+            score.cut & Motif %in% TFsToKeep) %>% pull(DORC) %>% 
+            unique()
+    }
+    net.d <- figR.d %>% dplyr::filter(DORC %in% DORCsToKeep & 
+        Motif %in% TFsToKeep) %>% reshape2::dcast(DORC ~ Motif) %>% 
+        tibble::column_to_rownames("DORC") %>% as.matrix()
+    message("Plotting ", nrow(net.d), " DORCs x ", ncol(net.d), 
+        "TFs\n")
+    myCols <- circlize::colorRamp2(seq(-2, 2, length.out = 9), 
+        colors = BuenColors::jdb_palette("solar_flare"))
+    myHeat <- ComplexHeatmap::Heatmap(net.d, col = myCols,
+         name = "Score", 
+        border = TRUE, row_names_gp = gpar(fontsize = 15, fontface = "italic"), heatmap_width = unit(2, "npc"),
+        ...)
+    myHeat
+}
+
+rankDrivers<- function (figR.d, rankBy = c("meanScore", "nTargets"), myLabels = NULL, 
+    score.cut = NULL, interactive = FALSE) 
+{
+    if (!rankBy %in% c("meanScore", "nTargets")) 
+        stop("rankBy parameter has to be one of meanScore or nTargets to rank drivers using ..\n")
+    if (rankBy %in% "meanScore") {
+        message("Ranking TFs by mean regulation score across all DORCs ..\n")
+        figR.summ <- figR.d %>% group_by(Motif) %>% dplyr::summarise(Score = mean(Score)) %>% 
+            arrange(Score) %>% mutate(Motif = factor(Motif, 
+            levels = as.character(Motif)))
+        figR.summ$TF <- as.character(figR.summ$Motif)
+        if (is.null(myLabels)) {
+            figR.summ$TF[figR.summ$Score >= quantile(figR.summ$Score, 
+                0.05) & figR.summ$Score <= quantile(figR.summ$Score, 
+                0.95)] <- ""
+        }
+        else {
+            figR.summ$TF[!figR.summ$TF %in% myLabels] <- ""
+        }
+        library(ggrepel)
+    gAll <- ggplot(figR.summ,aes(x=Motif,y=Score,label=TF)) + 
+      geom_bar(size=0.1,stat="identity",fill="darkorange",color=NA) + 
+      theme_classic() + theme(axis.text.x = element_text(size = 7), axis.text = element_text(size = 7), axis.title = element_text(size = 20)) + 
+      geom_hline(yintercept = 0) + labs(x="TF Motifs",y="Regulation Score")+coord_flip()
+    
+    gAll
+    }
+}
+
+plot_drivers<-function (figR.d, marker, score.cut = 1, label = TRUE) 
+{
+    if (!marker %in% figR.d$DORC) 
+        stop("Marker specified is not a valid DORC symbol found in the data.frame")
+    d <- figR.d %>% dplyr::filter(DORC %in% marker) %>% mutate(isSig = ifelse(abs(Score) >= 
+        score.cut, "Yes", "No"))
+    if (label) {
+        d$Label <- d$Motif
+        d$Label[d$isSig %in% "No"] <- ""
+    }
+    else {
+        d$Label <- ""
+    }
+    gScatter <- d %>% ggplot(aes(x = Corr.log10P, y = Enrichment.log10P, 
+        color = isSig, label = Label)) + geom_hline(yintercept = 0, 
+        color = "gray60", linetype = "dashed") + geom_vline(xintercept = 0, 
+        color = "gray60", linetype = "dashed") + geom_point(size = 0.8) + 
+        theme_classic() + scale_color_manual(values = c("gray66", 
+        "firebrick3")) + scale_x_continuous(breaks = scales::pretty_breaks()) + 
+        scale_y_continuous(breaks = scales::pretty_breaks()) + 
+        labs(y = "Enrichment log10 P", x = "Correlation log10 P", 
+            title = marker) + ylim(-ceiling(max(abs(d$Enrichment.log10P))), 
+        ceiling(max(abs(d$Enrichment.log10P)))) + xlim(-ceiling(max(abs(d$Corr.log10P))), 
+        ceiling(max(abs(d$Corr.log10P)))) + theme(legend.position = "none", 
+        axis.text = element_text(color = "black"), plot.title = element_text(hjust = 0.5, 
+            face = "italic"), panel.background = element_rect(fill = NA)) + 
+        geom_text(hjust = 1.1, fontface = "italic", color = "black", 
+            size = 3)
+    gScatter
+}
+
+```
+
+```{r load / prepare things}
+#prepare multi ome data
+ATAC.se <- SummarizedExperiment(assays = list(counts = MO[["ATAC"]]@data) , rowRanges =MO[["ATAC"]]@ranges, colData = MO@meta.data)
+
+RNAmat<- MO[["SCT"]]@data %>% as.sparse()
+
+cisCor <- runGenePeakcorr(ATAC.se = ATAC.se,
+                           RNAmat = RNAmat,
+                           genome = "hg38", # Also supports mm10 and hg38
+                           nCores = detectCores(), 
+                           p.cut=NULL)
+
+cisCor<-read.csv(file.path(RES_DIR, "cisCor.csv"))
+                    
+# Filter peak-gene correlations by p-value                    
+cisCor.filt <- cisCor %>% dplyr::filter(pvalZ <= 0.05)
+
+# Determine DORC genes
+dp <- cisCor.filt %>% dorcJPlot(cutoff=4, # Default
+                                       returnGeneList =F, labelTop = 10, labelSize = 3, cleanLabels = T)
+
+
+dorcGenes<-c(dorcGenes, "SELL")
+
+# Get DORC scores
+dorcMat <- getDORCScores(ATAC.se ,dorcTab=cisCor.filt,geneList=dorcGenes,nCores=detectCores())
+
+lsi <- MO@reductions$wnn.umap@cell.embeddings %>% as.data.frame()
+
+# rownames(lsi)<- gsub("#", "_",rownames(lsi) )
+
+lsi <- lsi[which(rownames(lsi) %in% colnames(dorcMat)),]
+dorcMat <- dorcMat[,which(colnames(dorcMat) %in% rownames(lsi))]
+ATAC.se <- ATAC.se[, which(colnames(ATAC.se) %in% rownames(lsi))]
+RNAmat <- RNAmat[, which(colnames(RNAmat) %in% rownames(lsi))]
+
+
+lsi.knn <- FNN::get.knn(lsi,k=30)$nn.index
+rownames(lsi.knn) <- colnames(dorcMat)
+
+# Smooth DORC scores (using cell KNNs)
+dorcMat.smooth <- smoothScoresNN(NNmat=lsi.knn,mat=dorcMat,nCores=detectCores())
+
+human_pwms_v3 <- readRDS("~/cisBP_human_pfms_2021.rds")
+rnaMat.smoothed <- smoothScoresNN(NNmat = lsi.knn,mat = RNAmat,nCores = detectCores(),geneList=intersect(rownames(RNAmat),names(human_pwms_v3)))
+
+fig.d <- runFigRGRN(ATAC.se=ATAC.se,
+                    rnaMat=rnaMat.smoothed, # Smoothed RNA matrix using paired cell kNNs
+                    dorcMat=dorcMat.smooth,
+                    dorcTab=cisCor.filt,
+                    genome="hg38",
+                    dorcGenes=dorcGenes,
+                    nCores=detectCores())
+
+write.csv(fig.d, file.path(RES_DIR, "stim_figR_cd27.csv"))
+```
+
+```{r make dual heatmaps}
+sub<-fig.d[abs(fig.d$Score) >= 1.4,]
+rankDrivers(sub, rankBy = "meanScore")
+chrom_cell_line_avg<-AverageExpression(MO, assay ="chromvar", group.by = "group")
+chrom_mat <- chrom_cell_line_avg[[1]][unique(sub$Motif),] %>% as.matrix()
+
+
+chrom_mat<-MO@assays$chromvar@data[unique(sub$Motif),]
+chrom_mat<- t(scale(t(chrom_mat)))
+library(viridis)
+#c("gray85", "#468c58", "#edcc0e")
+
+group_anno<-factor(MO$group)
+quantile(chrom_mat)
+
+h1<-Heatmap(chrom_mat, name = "chromVAR", col = colorRamp2(c(-5, 0, 5), c("#04578f", "gray85", "#fffb17")), row_names_gp = gpar(fontsize = 12), column_names_gp = gpar(fontsize = 16), column_names_rot = -90, row_names_rot = -0, cluster_columns =F,width = 100, cluster_rows = T, show_column_dend = T, show_row_dend = F, show_row_names = T, column_split = group_anno, show_column_names = F, cluster_column_slices = T, use_raster = F)
+h1
+
+
+cell_line_avg<-AverageExpression(MO, assay ="SCT", group.by = "group")
+rna_mat <-cell_line_avg[[1]][unique(sub$Motif),] %>% as.matrix()
+
+rna_mat<-MO@assays$SCT@data[unique(sub$Motif),]
+rna_mat<- t(scale(t(rna_mat)))
+
+quantile(rna_mat)
+
+h2<-Heatmap(rna_mat, name = "RNA",  col = colorRamp2(c(-1, 0, 2), c("#04578f", "gray85", "#801b1b")), row_names_gp = gpar(fontsize = 12), column_names_gp = gpar(fontsize = 16), column_names_rot = -90, row_names_rot = -0, cluster_columns =F,width = 100, cluster_rows = T, show_column_dend = T, show_row_dend = F, show_row_names = T, column_split = group_anno, show_column_names = F, cluster_column_slices = T, use_raster = F)
+h2
+```
+
+```{r make correlation heatmap}
+chrom_cell_line_avg<-AverageExpression(MO, assay ="chromvar", group.by = "group")
+chrom_mat <- chrom_cell_line_avg[[1]][unique(sub$Motif),] %>% as.matrix()
+cell_line_avg<-AverageExpression(MO, assay ="SCT", group.by = "group")
+rna_mat <-cell_line_avg[[1]][unique(sub$Motif),] %>% as.matrix()
+
+rna_mat<- t(scale(t(rna_mat)))
+chrom_mat<- t(scale(t(chrom_mat)))
+List_M<-list(rna_mat, chrom_mat)
+cor<-Reduce("+",List_M)/length(List_M)
+# cor<- t(scale(t(cor)))
+
+quantile(cor)
+
+# Heatmap(cor, col=rev(brewer.rdylbu(n=7)),show_column_names = T, show_column_dend = F, show_row_dend = F, use_raster = T)
+# Heatmap(cor, col=c("#04578f","gray80", "#e7f218"),show_column_names = T, show_column_dend = F, show_row_dend = F, use_raster = T)
+# Heatmap(cor, col=rev(brewer.spectral(n=7)),show_column_names = T, show_column_dend = F, show_row_dend = F, use_raster = T)
+t<-BuenColors::jdb_palette("brewer_spectra")
+t<-c(t[1:3], "#e5e6e1", t[7:9])
+
+ht<-Heatmap(cor[,c("Naive", "24hr_3/27", "24hr_Beads")], col=t,show_column_names = T, show_column_dend = F, show_row_dend = T, use_raster = F, cluster_columns = F, row_names_side = "left", row_dend_side = "right")
+ht
+```
+
+```{r take max for each tf to find specificity}
+tf_spec<-sapply(rownames(cor), function(x){
+  col<-cor[x,, drop = F] %>% which.max()
+  colnames(cor)[col]
+})
+tf_spec
+```
+
+```{r color ranked drivers by group, order by heatmap dendrograms}
+ht = draw(ht)
+rownames(cor)[row_order(ht)]
+
+ranks<- function (figR.d, rankBy = c("meanScore"), myLabels = NULL, 
+    score.cut = NULL, interactive = FALSE) 
+{
+    if (!rankBy %in% c("meanScore", "nTargets")) 
+        stop("rankBy parameter has to be one of meanScore or nTargets to rank drivers using ..\n")
+    if (rankBy %in% "meanScore") {
+        message("Ranking TFs by mean regulation score across all DORCs ..\n")
+        figR.summ <- figR.d %>% group_by(Motif) %>% dplyr::summarise(Score = mean(Score)) %>% 
+            arrange(Score) %>% mutate(Motif = factor(Motif, 
+            levels = as.character(Motif)))
+        figR.summ$TF <- as.character(figR.summ$Motif)
+        if (is.null(myLabels)) {
+            figR.summ$TF[figR.summ$Score >= quantile(figR.summ$Score, 
+                0.05) & figR.summ$Score <= quantile(figR.summ$Score, 
+                0.95)] <- ""
+        }
+        else {
+            figR.summ$TF[!figR.summ$TF %in% myLabels] <- ""
+        }
+        library(ggrepel)
+      figR.summ
+    }
+}
+  
+figR.summ<-ranks(sub)
+figR.summ$group <-"t"
+
+tf_spec<-tf_spec[order(match(names(tf_spec), figR.summ$Motif))]  
+
+figR.summ$group<-tf_spec
+figR.summ$Motif <- factor(figR.summ$Motif, levels = rev(rownames(cor)[row_order(ht)]))
+
+gAll <- ggplot(figR.summ,aes(x=Motif,y=Score,label=TF, fill = group)) + 
+  geom_bar(size=0.1,stat="identity",color=NA) + 
+  theme_classic() + theme(axis.text.x = element_text(size = 7), axis.text = element_text(size = 7), axis.title = element_text(size = 20)) + 
+  geom_hline(yintercept = 0) + labs(x="TF Motifs",y="Regulation Score")+coord_flip()+scale_fill_manual(values =c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))
+
+gAll
+```
+
+```{r AddModuleScore Loop of TF target genes}
+tfs<-unique(fig.d[fig.d $Score > 1.4, ]$Motif)
+i<-tfs[40]
+DefaultAssay(MO)<-"SCT"
+score_list<-pbmclapply(tfs, function(i){
+  genes<-fig.d[fig.d$Motif == i & fig.d$Score > 0 ,]$DORC
+  MO<-AddModuleScore(MO, features = list(genes), name = paste0(i, "_target_genes"))
+  met<-MO@meta.data[,paste0(i, "_target_genes1")]
+  meta<-data.frame( met, row.names = colnames(MO))
+  meta
+}, mc.cores = detectCores())
+
+names(score_list)<-tfs
+score_df<-do.call(cbind, score_list)
+names(score_df)<-paste0(tfs, "_target_genes")
+
+MO@meta.data<-cbind(MO@meta.data, score_df)
+names(MO@meta.data)
+for(i in 69:108){
+  svglite::svglite(file.path(FIG_DIR, "TF_target gene regualtion_violin plots",paste0(names(MO@meta.data)[i], ".svg" )), width = 3, height = 3)
+  plot(VlnPlot(MO, features = names(MO@meta.data)[i], group.by = "group", cols = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"), pt.size = 0)+ggtitle(label = ""))
+  dev.off()
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#GRAVEYARD
+```{r}
+library(msigdbr)
+library(fgsea)
+library(Seurat)
+library(ggplot2)
+library(tibble)
+library(pbmcapply)
+library(stringr)
+library(parallel)
+install_github('immunogenomics/presto')
+library(presto)
+#hallmark pathways gene sets
+m_df<- msigdbr(species = "Homo sapiens", category = "H")
+
+DefaultAssay(MO)<-"SCT"
+genes <- wilcoxauc(MO, 'group')
+#pick one gene set then run the next lines
+fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+
+x<-"Naive"
+gsea_list<- pbmclapply(levels(factor(MO$group)), function(x){
+genes<- genes %>%
+    dplyr::filter(group== x) %>%
+    dplyr::filter(!str_detect(feature ,"^RPL")) %>%
+    dplyr::filter(!str_detect(feature, "^RPS"))%>%
+    dplyr::filter(!str_detect(feature, "^MT-")) %>%
+    dplyr::arrange(desc(logFC), desc(auc)) %>%
+    dplyr::select(feature,logFC)
+ranks<-deframe(genes)
+fgseaRes<- fgsea(fgsea_sets, stats = ranks, nperm = 1000)
+fgseaResTidy <- fgseaRes %>%
+as_tibble() %>%
+ dplyr::arrange(desc(NES))
+fgseaResTidy %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  dplyr::arrange(padj) %>% 
+  head()
+fgseaResTidy
+}, mc.cores = detectCores())
+
+#cahnge MO$group
+names(gsea_list)<-levels(factor(MO$group))
+
+gsea_list2 <- lapply(1:length(gsea_list), function(x){
+  gsea_list[[x]]$subgroup<- rep(names(gsea_list)[[x]], length(gsea_list[[x]]$pval))
+  gsea_list[[x]]
+})
+
+df <- do.call("rbind",gsea_list2)
+df$pathway
+#select significant pathways
+top_tmers<- df %>%
+    dplyr::filter(pval < 0.05)%>%
+    dplyr::group_by(subgroup) 
+#get unique pathways
+top_pathways<-fgsea_sets[unique(top_tmers$pathway)]
+#get values from other groups of top pathways
+all_values<- df[which(df$pathway %in% names(top_pathways)),]
+all_values<- all_values %>%  dplyr::arrange(desc(NES)) %>% dplyr::group_by(subgroup)
+all_values$pathway<-factor(all_values$pathway, levels = rev(names(top_pathways)))
+all_values$sig<-all_values$pval
+all_values$sig[all_values$pval < 0.05]<-"YES"
+all_values$sig[all_values$pval > 0.05]<-"NO"
+#make dot plot of gene set enrichments
+pal <- ArchR::paletteContinuous("coolwarm")
+ggplot(data = all_values %>% dplyr::filter(sig == "YES"), aes(x = subgroup, y = pathway)) + 
+  geom_point(aes(size = size, fill = NES), alpha = 0.75, shape = 21) +theme_bw()+NoGrid()+scale_fill_gradientn(colors = pal)
+```
+
+
+
+
+
+
+```{r}
+filt<-fig.d[fig.d$Score > 1.4, ]
+
+
+p<-DotPlot(MO, assay = "SCT", features = unique(filt$Motif), group.by = "group")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+coord_flip()+labs(title = "RNA")
+
+q<-DotPlot(MO, assay = "chromvar", features = unique(filt$Motif), group.by = "group")+scale_color_gradientn(colors =rev(mako(9)))+coord_flip()+labs(title = "Motif Enrichment")
+
+p+q
+```
+
+```{r TCF7 & LEF1 target genes }
+sub<-fig.d[fig.d$Motif %in% c("TCF7", "LEF1") & fig.d$Score > 0.5,]
+
+p<-DotPlot(MO, assay = "SCT", features = unique(sub$DORC), group.by = "group")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+coord_flip()+labs(title = "RNA")
+
+q<-DotPlot(MO, assay = "GENE_ACC", features = unique(sub$DORC), group.by = "group")+scale_color_gradientn(colors = c("gray75", jdb_palette("brewer_marine", n = 9, "discrete")[c(9, 5, 4)]))+coord_flip()+labs(title = "Gene Accessibility")
+
+p+q
+```
+
+
+```{r Naive to Cd27 trajectory}
+library(Signac)
+library(Seurat)
+library(SeuratWrappers)
+library(monocle3)
+library(Matrix)
+library(ggplot2)
+library(patchwork)
+
+seurat_to_monocle3 <-function(seu, seu_rd="umap", mon_rd="UMAP", assay_name="RNA"){
+  cds<-new_cell_data_set(seu@assays[[assay_name]]@counts, 
+                         cell_metadata = seu@meta.data, 
+                         gene_metadata = DataFrame(
+                           row.names = rownames(seu@assays[[assay_name]]@counts), 
+                           id=rownames(seu@assays[[assay_name]]@counts), 
+                           gene_short_name=rownames(seu@assays[[assay_name]]@counts)))
+  reducedDims(cds)[[mon_rd]]<-seu@reductions[[seu_rd]]@cell.embeddings
+  cds
+}
+
+sub <- MO[,  MO$exp_group %in% c("Naive", "CD27")]
+DefaultAssay(MO) <- "SCT"
+cds <- seurat_to_monocle3(MO, seu_rd  = "wnn.umap", assay_name="SCT")
+cds <- cluster_cells(cds = cds, reduction_method = "UMAP")
+cds <- learn_graph(cds, use_partition = TRUE)
+plot_cells(cds)
+cds <- order_cells(cds, reduction_method = "UMAP")
+
+# plot trajectories colored by pseudotime
+plot_cells(
+  cds = cds,
+  color_cells_by = "pseudotime",
+  show_trajectory_graph = F
+)
+
+AFD_genes <- c("GAPDH")
+AFD_lineage_cds <- cds[rowData(cds)$gene_short_name %in% AFD_genes,]
+plot_genes_in_pseudotime(AFD_lineage_cds,
+                         color_cells_by="exp_group",
+                         min_expr=0.5)
+
+```
+
+```{r Custom GSEA get gene set}
+markers<-read.csv(file.path(RES_DIR,"RNA_markers_clusters.csv"))
+
+c_type<- read.csv(file.path(ROOT_DIR, stem , "genesets/cd8_cell_type.csv"))
+
+c_type<- read.csv(file.path(ROOT_DIR, stem , "genesets/cell_signal.csv"))
+
+c_type<- read.csv(file.path(ROOT_DIR, stem , "genesets/biological_process.csv"))
+
+c_type<- read.csv(file.path(ROOT_DIR, stem , "genesets/metabolism.csv"))
+
+fgsea_sets<- lapply(names(c_type), function(x){
+  l<-c_type[,x]
+  l<-l[l != ""]
+})
+
+names(fgsea_sets)<-names(c_type)
+```
+
+```{r updated bubble plots}
+m_df<- msigdbr(species = "Homo sapiens", category = "H") %>% dplyr::filter(gs_name %in% c("HALLMARK_ALLOGRAFT_REJECTION",
+"HALLMARK_E2F_TARGETS",
+"HALLMARK_G2M_CHECKPOINT",
+"HALLMARK_GLYCOLYSIS",
+"HALLMARK_HYPOXIA",
+"HALLMARK_INTERFERON_GAMMA_RESPONSE",
+"HALLMARK_MTORC1_SIGNALING",
+"HALLMARK_MYC_TARGETS_V1",
+"HALLMARK_MYC_TARGETS_V2",
+"HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+"HALLMARK_UNFOLDED_PROTEIN_RESPONSE",
+"HALLMARK_UV_RESPONSE_DN"))
+
+#immune sig sets
+m_df<- msigdbr(species = "Homo sapiens", category = "C7", subcategory = "IMMUNESIGDB") %>% dplyr::filter(gs_name %in% c("GSE14699_NAIVE_VS_ACT_CD8_TCELL_DN",
+"GSE15930_NAIVE_VS_24H_IN_VITRO_STIM_CD8_TCELL_DN",
+"GSE15930_NAIVE_VS_24H_IN_VITRO_STIM_IL12_CD8_TCELL_DN",
+"GSE15930_NAIVE_VS_24H_IN_VITRO_STIM_INFAB_CD8_TCELL_DN",
+"GSE15930_NAIVE_VS_48H_IN_VITRO_STIM_CD8_TCELL_DN",
+"GSE21360_PRIMARY_VS_QUATERNARY_MEMORY_CD8_TCELL_DN",
+"GSE41867_LCMV_ARMSTRONG_VS_CLONE13_DAY6_EFFECTOR_CD8_TCELL_DN",
+"GSE41867_NAIVE_VS_EFFECTOR_CD8_TCELL_DN",
+"GSE41978_KLRG1_HIGH_VS_LOW_EFFECTOR_CD8_TCELL_DN",
+"GSE41978_KLRG1_HIGH_VS_LOW_EFFECTOR_CD8_TCELL_DN",
+"GSE41978_KLRG1_HIGH_VS_LOW_EFFECTOR_CD8_TCELL_DN",
+"GSE41978_KLRG1_HIGH_VS_LOW_EFFECTOR_CD8_TCELL_DN"))
+
+
+#KEGG sets
+m_df<- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")%>% dplyr::filter(gs_name %in% c("KEGG_ANTIGEN_PROCESSING_AND_PRESENTATION",
+"KEGG_APOPTOSIS",
+"KEGG_CYTOKINE_CYTOKINE_RECEPTOR_INTERACTION",
+"KEGG_GLYCOLYSIS_GLUCONEOGENESIS",
+"KEGG_SPLICEOSOME",
+"KEGG_VIRAL_MYOCARDITIS"))
+
+#REACTOME sets
+m_df<- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")%>% dplyr::filter(gs_name %in% c("REACTOME_CELL_CYCLE",
+"REACTOME_CELL_CYCLE_MITOTIC",
+"REACTOME_CELLULAR_RESPONSES_TO_STIMULI",
+"REACTOME_M_PHASE",
+"REACTOME_METABOLISM_OF_RNA",
+"REACTOME_MRNA_SPLICING",
+"REACTOME_ORGANELLE_BIOGENESIS_AND_MAINTENANCE",
+"REACTOME_PROCESSING_OF_CAPPED_INTRON_CONTAINING_PRE_MRNA",
+"REACTOME_SIGNALING_BY_RHO_GTPASES_MIRO_GTPASES_AND_RHOBTB3"))
+
+fgsea_sets<- m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+```
+```{r Custom GSEA}
+library(tibble)
+x<-"1"
+gsea_list<- pbmclapply(levels(factor(MO$clusters)), function(x){
+genes<- markers[markers$cluster ==x,] %>%
+    dplyr::filter(!str_detect(gene ,"^RPL")) %>%
+    dplyr::filter(!str_detect(gene, "^RPS"))%>%
+    dplyr::filter(!str_detect(gene, "^MT-")) %>%
+    arrange(desc(avg_log2FC)) %>% 
+    dplyr::select(gene,avg_log2FC)
+
+ranks<-deframe(genes)
+fgseaRes<- fgsea(fgsea_sets, stats = ranks, nperm = 1000)
+
+fgseaResTidy <- fgseaRes %>%
+as_tibble() %>%
+ arrange(desc(NES))
+
+fgseaResTidy %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  arrange(padj) %>% 
+  head()
+
+fgseaResTidy
+}, mc.cores = detectCores())
+
+names(gsea_list)<-levels(factor(MO$clusters))
+
+gsea_list2 <- lapply(1:length(gsea_list), function(x){
+  gsea_list[[x]]$subgroup<- rep(names(gsea_list)[[x]], length(gsea_list[[x]]$pval))
+  gsea_list[[x]]
+})
+
+df <- do.call("rbind",gsea_list2)
+
+#select significant pathways go immunesigdb
+top_tmers<- df %>%
+    dplyr::group_by(subgroup)
+
+#get unique pathways
+top_pathways<-fgsea_sets[unique(top_tmers$pathway)]
+
+#get values from other groups of top pathways
+all_values<- df[which(df$pathway %in% names(top_pathways)),]
+all_values<- all_values %>%  dplyr::arrange(pval) %>% group_by(subgroup)
+all_values$sig<-all_values$pval
+all_values$sig[all_values$pval < 0.05]<-"YES"
+all_values$sig[all_values$pval > 0.05]<-"NO"
+
+all_values$pathway<-factor(all_values$pathway, levels = rev(unique(all_values$pathway)))
+
+#make dot plot of gene set enrichments
+pal <- ArchR::paletteContinuous("coolwarm")
+ggplot(data = all_values[all_values$sig == "YES",], aes(x = subgroup, y = pathway)) + 
+  geom_point(aes(size = size, fill = NES), alpha = 0.75, shape = 21) +theme_bw()+NoGrid()+scale_fill_gradientn(colors = pal)
+
+```
+```{r Heatmap gene score of CD8 cell types}
+type_list
+DefaultAssay(MO)<-"SCT"
+cluster_averages<-AverageExpression(MO, group.by="clusters", return.seurat = T)
+cluster_averages<-AddModuleScore(cluster_averages, features = type_list)
+# names(cluster_averages@meta.data)[grepl("^Cluster", names(cluster_averages@meta.data))]<-names(type_list)
+mat<- t(as.matrix(cbind(cluster_averages@meta.data[,grepl("^Cluster", names(cluster_averages@meta.data))])))
+rownames(mat)<-names(type_list)
+mat<- t(scale(t(mat)))
+quantile(mat, c(0.05, 0.95))
+library(RColorBrewer)
+pheat<-rev(brewer.pal("RdYlBu", n = 7))
+col_fun = circlize::colorRamp2(c(-1.4, -1, -0.5, 0, 0.5, 1, 1.4), pheat)
+ht<-ComplexHeatmap::Heatmap(mat, cluster_rows = T, cluster_columns = F, col = col_fun, show_column_dend = F,  show_row_dend = F,column_names_rot = 0, row_names_side = "left", row_names_gp = gpar(fontsize = 20),column_names_gp = gpar(fontsize = 20), width = 50, height = 50)
+draw(ht, padding = unit(c(20, 200, 20, 20), "mm")) ## see right heatmap in following
+
+
+```
+```{r Experimental Group/ cluster specifcity of top TFS}
+filt <- filt %>% arrange(desc(Score))
+
+#dot plot of motif accessibility
+DotPlot_scCustom(MO, assay = "chromvar", features = "insert here!" , cluster.idents = T, group.by = "group", colors_use = "pick a color palette!" )+coord_flip()+RotatedAxis()
+
+#do the same for expression
+DotPlot_scCustom(MO, assay = "SCT",  cluster.idents = T, group.by = "group", colors_use = c("gray70", "#04578f", "#801b1b"))+coord_flip()+RotatedAxis()
+
+##look at individual TFS, play around with all the visualizations you can make with signac/seurat
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "YBX1", reduction = "wnn.umap", colors_use = viridis(10), na_cutoff = 0.5, max.cutoff = "q99")
+VlnPlot(MO, features = "YBX1", assay = "SCT", group.by = "clusters", pt.size = 0,cols = ArchR::paletteDiscrete(values = levels(factor(MO$clusters))))
+
+DimPlot(MO, cols = ArchR::paletteDiscrete(values = levels(factor(MO$clusters))), group.by = "clusters", reduction = "wnn.umap")
+
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "IKZF1", reduction = "wnn.umap", colors_use = viridis(10))
+
+
+VlnPlot(MO, features = "SAMD9L", assay = "SCT", group.by = "clusters", pt.size = 0,cols = ArchR::paletteDiscrete(values = levels(factor(MO$clusters))))
+
+#make heatmaps!
+
+#look at SCT and chromvar
+DefaultAssay(MO)<-"SCT"
+cluster_averages<-AverageExpression(MO, group.by="clusters", return.seurat = F)
+
+mat<- t(as.matrix(cluster_averages["subset by which TFS you want to look at",]))
+mat<- t(scale(t(mat)))
+quantile(mat, c(0.05, 0.95))
+library(RColorBrewer)
+#play around with color palettes
+pheat<-rev(brewer.pal("RdYlBu", n = 7))
+col_fun = circlize::colorRamp2(c(-1.4, -1, -0.5, 0, 0.5, 1, 1.4), pheat)
+
+#resources on complex heatmap can be found here
+#https://jokergoo.github.io/ComplexHeatmap-reference/book/
+ht<-ComplexHeatmap::Heatmap(mat, cluster_rows = T, cluster_columns = F, col = col_fun, show_column_dend = F,  show_row_dend = F,column_names_rot = 0, row_names_side = "left", row_names_gp = gpar(fontsize = 20),column_names_gp = gpar(fontsize = 20), width = 50, height = 50)
+draw(ht, padding = unit(c(20, 200, 20, 20), "mm")) ## see right heatmap in following
+
+```
+
+
+
+```{r}
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "ATF2", reduction = "wnn.umap", order = T)
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "ATF2", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))
+DotPlot(MO, assay = "SCT", features = c("ZNF85", "ZBTB20", "ATF2", "STAT1", "FOXP1", "FOXO1"), group.by = "group")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))
+DotPlot(MO, assay = "chromvar", features = c("ZNF85", "ZBTB20", "ATF2", "STAT1", "FOXP1", "FOXO1"), group.by = "group")+scale_color_gradientn(colors = c("gray85", rev(mako(15))[1:13]))
+
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "LEF1", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "LEF1", reduction = "wnn.umap", order = T)
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "TCF7", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "TCF7", reduction = "wnn.umap", order = T)
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "RUNX1", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "RUNX1", reduction = "wnn.umap", order = T)
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "MXI1", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "MXI1", reduction = "wnn.umap", order = T)
+
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "STAT1", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot_scCustom(MO, features = "STAT1", reduction = "wnn.umap", order = T)&NoAxes()
+```
+
+```{r}
+DefaultAssay(MO)<-"SCT"
+FeaturePlot_scCustom(MO, features = "IFNG", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+FeaturePlot_scCustom(MO, features = "IFNAR2", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+DefaultAssay(MO)<-"GENE_ACC"
+FeaturePlot_scCustom(MO, features = "IFNAR2", reduction = "wnn.umap", order = T, colors_use = viridis(10))&NoAxes()
+
+FeaturePlot_scCustom(MO, features = "IFNGR2", reduction = "wnn.umap", order = T, colors_use = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+rownames(MO)[grep("IFN", rownames(MO))]
+```
+
+
+```{r visualize top regulators Dot Plots}
+p<-plotDrivers(fig.d, marker = "TCF7", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+q<-FeaturePlot(MO, features = "POU2F2", reduction = "wnn.umap", order = T)+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+c<-FeaturePlot(MO, features = "FOXN3", reduction = "wnn.umap", order = T)+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+p+q+c
+
+plotDrivers(fig.d, marker = "SELL", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = "ZNF8", reduction = "wnn.umap")
+
+plotDrivers(fig.d, marker = "PRMT2", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = "ZNF8", reduction = "wnn.umap")
+```
+
+
+```{r visualize top regulators Dot Plots}
+plotDrivers(fig.d, marker = "CCR7", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = "VDR", reduction = "wnn.umap")
+FeaturePlot(MO, features = "MYBL2", reduction = "wnn.umap", order  =T)+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+FeaturePlot(MO, features = "FOS", reduction = "wnn.umap", order  =T)+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+FeaturePlot(MO, features = "JUN", reduction = "wnn.umap", order  =T)+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+
+plotDrivers(fig.d, marker = "CCL4", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = "NFATC2", reduction = "wnn.umap")
+
+plotDrivers(fig.d, marker = "IL2RA", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = "NFATC2", reduction = "wnn.umap")
+
+plotDrivers(fig.d, marker = "IL2", score.cut = 1)
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = "PLAGL2", reduction = "wnn.umap", order = T)
+FeaturePlot(MO, features = "ZEB2", reduction = "wnn.umap", order = T, max.cutoff = "q90")
+
+FeaturePlot(MO, features = "ETV6", reduction = "wnn.umap", order = T, max.cutoff = "q90")
+FeaturePlot(MO, features = "IL21R", reduction = "wnn.umap", order = T, max.cutoff = "q90")
+
+plotfigRHeatmap(fig.d,
+                score.cut = 0.57,
+                DORCs = "IKZF2",
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+plotfigRHeatmap(fig.d,
+                score.cut = 0.57,
+                DORCs = "TCF7",
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+plotfigRHeatmap(fig.d,
+                score.cut = 0.5,
+                TFs = "ETV6",
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d,
+                score.cut = 1.5,
+                TFs = c("FOS", "JUN"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+plotfigRHeatmap(fig.d,
+                score.cut = 0.5,
+                TFs = c("IKZF1"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+DotPlot(MO, assay = "SCT", features = c("FOS", "JUN", unique(fig.d[fig.d$Motif %in% c("FOS", "JUN") & fig.d$Score < -1.5,]$DORC)), group.by ="group")+coord_flip()+scale_color_gradientn(colors = c("gray70", "#04578f", "#801b1b"))
+
+
+
+MO$group<-factor(MO$group, levels = c("Naive", "24hr_3/27", "24hr_Beads"))
+
+#TF ACTIVATORS
+p<-DotPlot(MO, assay = "SCT", features = c(  "ZEB2",  "ATF4", "PLAGL2", "TBX21",  "MYBL2","RBPJ","RUNX3", "BACH1","LEF1",  "NFKB1","FOXO1","FOXP1"), group.by = "group")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+coord_flip()+labs(title = "RNA")+RotatedAxis()
+
+q<-DotPlot(MO, assay = "chromvar", features = c(  "ZEB2",  "ATF4", "PLAGL2", "TBX21",  "MYBL2","RBPJ","RUNX3", "BACH1","LEF1",  "NFKB1","FOXO1","FOXP1"), group.by = "group")+scale_color_gradientn(colors = c("gray90", rev(mako(15))[1:12]))+coord_flip()+labs(title = "ChromVAR")+RotatedAxis()
+
+
+p+q
+
+#TF REPRESSORS
+z<-DotPlot(MO, assay = "SCT", features = c("MYB", "RUNX1", "RUNX2", "JUN", "FOS", "NR4A2", "BACH2"), group.by = "group")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+coord_flip()+labs(title = "RNA")+RotatedAxis()
+
+x<-DotPlot(MO, assay = "chromvar", features = c("MYB", "RUNX1", "RUNX2", "JUN", "FOS", "NR4A2", "BACH2"), group.by = "group")+scale_color_gradientn(colors = c("gray90", rev(mako(15))[1:12]))+coord_flip()+labs(title = "ChromVAR")+RotatedAxis()
+
+
+z+x
+
+```
+
+```{r visualize DA TFS}
+filt<-fig.d [fig.d $Score < -1.4 |fig.d $Score > 1.4, ]
+filt<-na.omit(filt)
+
+rankDrivers(figR.d = filt) 
+rankDrivers(figR.d = fig.d ) 
+fig.d <-na.omit(fig.d )
+
+plotfigRHeatmap(fig.d ,
+                TFs = fig.d$Motif[grepl("ETV", fig.d$Motif)],
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=12),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = T,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+
+plotfigRHeatmap(fig.d ,
+                TFs = fig.d$Motif[grepl("IKZF", fig.d$Motif)],
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=12),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = T,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d ,
+                TFs = unique(fig.d$Motif[grepl("ELF", fig.d$Motif)]),
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = T,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d ,
+                TFs = unique(fig.d$Motif[grepl("ELF", fig.d$Motif)]),
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=8),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = T,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+
+plotfigRHeatmap(fig.d ,
+                TFs = fig.d$Motif[grepl("ETS", fig.d$Motif)],
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = T,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d ,
+                TFs = fig.d$Motif[grepl("ELK", fig.d$Motif)],
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = T,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d ,
+                TFs = unique(fig.d$Motif[grepl("FOX", fig.d$Motif)]),
+                score.cut = 1.5,
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows = ,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d ,
+                TFs = c("TCF7","LEF1"),
+                score.cut = 0.5,
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                cluster_rows =T ,
+                cluster_columns = T,
+                column_names_rot = 45
+)
+
+```
+
+
+```{r visualize regulators of tfs}
+#FOXP1, FOXO1, LEF1, BACH1, BACH2, RUNX2, MYB, JUN, FOS, IKZF1, TBX21, RUNX3
+
+
+plotDrivers(fig.d, marker = "IKZF1", score.cut = 0.5, label = F)
+
+plotfigRHeatmap(fig.d,
+                score.cut = 0.5,
+                DORCs = c("RUNX2"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+plotfigRHeatmap(fig.d,
+                score.cut = 0.5,
+                DORCs = c("FOS"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+plotfigRHeatmap(fig.d,
+                score.cut = 0.5,
+                DORCs = c("TBX21"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+plotfigRHeatmap(fig.d,
+                score.cut = 0.5,
+                TFs = c("FOXO1", "FOXP1", "TCF7", "LEF1"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+```
+
+```{r visualize FOXO1/FOXP1}
+sub<-fig.d[fig.d$Motif %in% c("FOXO1", "FOXP1"),]
+sub<- sub  %>% dplyr::filter(abs(Score) > 0.5)
+
+
+sub$DORC
+
+p<-DotPlot(MO, assay = "SCT", features = unique(sub$DORC), group.by = "group")+coord_flip()+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+RotatedAxis()
+p
+
+q<-plotfigRHeatmap(fig.d,
+                score.cut = 0.57,
+                TFs = c("FOXP1", "FOXO1"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+q
+```
+
+```{r visualize TCF7}
+sub<-fig.d[fig.d$Motif %in% c("TCF7"),]
+sub<- sub  %>% dplyr::filter(abs(Score) > 0.5)
+
+DefaultAssay(MO)<-"SCT"
+MO<-AddModuleScore(MO, features = list(sub$DORC), name = "tcf7_targets")
+MO$group<-factor(MO$group, levels = c("Naive", "24hr_3/27", "24hr_Beads"))
+```
+
+```{r visualize LEF1}
+sub<-fig.d[fig.d$Motif %in% c("LEF1"),]
+sub<- sub  %>% dplyr::filter(abs(Score) > 0.5)
+```
+
+```{r visualize FOXP1}
+sub<-fig.d[fig.d$Motif %in% c("FOXP1"),]
+sub<- sub  %>% dplyr::filter(abs(Score) > 0.5)
+q<-plotfigRHeatmap(fig.d,
+                score.cut = 0.57,
+                DORCs = c("IKZF2"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+q
+
+```
+
+```{r visualize FOXP1}
+sub<-fig.d[fig.d$Motif %in% c("FOXP1"),]
+sub<- sub  %>% dplyr::filter(abs(Score) > 0.5)
+
+q<-plotfigRHeatmap(fig.d,
+                score.cut = 0.57,
+                DORCs = c("IKZF2"),
+                column_names_gp=gpar(fontsize=15),
+                show_row_dend = FALSE,
+                column_names_side = "top",
+                show_column_dend = T,
+                column_names_rot = 45
+)
+
+q
+
+```
+
+
+```{r IKZF TFS}
+DefaultAssay(MO)<-"SCT"
+FeaturePlot(MO, features = c("IKZF2"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+FeaturePlot(MO, features = c("STAT1"), reduction = "wnn.umap", max.cutoff = "q99", order = T)+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))&NoAxes()
+VlnPlot(MO, features = c("IKZF3"), group.by = "seurat_clusters",pt.size = 0,cols = c("#f7570c",   "#2d1aab","#00a6ff", "#408075",  "#bd2bb6", "#bea1ed","#fada25","#B5D33D",  "#a12a5b" ))
+library(viridis)
+DefaultAssay(MO)<-"chromvar"
+FeaturePlot(MO, features = c("STAT1"), reduction = "wnn.umap", max.cutoff = "q95", order = T)+scale_color_gradientn(colors = c("#04578f", "gray85", "#fffb17")), row_names_gp = gpar(fontsize = 12), column_names_gp = gpar(fontsize = 16), column_names_rot = -90, row_names_rot = -0, cluster_columns =F,wid))+ggtitle(label = "IKZF1")&NoAxes()
+```
+
+```{r look at ETS, IKZF, FOX TFS}
+DotPlot(MO, features = c(rownames(MO)[grep("ETV", rownames(MO))], rownames(MO)[grep("IKZF", rownames(MO))], rownames(MO)[grep("FOX", rownames(MO))]), assay = "SCT", group.by = "clusters")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+coord_flip()
+
+DefaultAssay(MO)<-"chromvar"
+DotPlot(MO, features = c(rownames(MO)[grep("ETV", rownames(MO))], rownames(MO)[grep("IKZF", rownames(MO))], rownames(MO)[grep("FOX", rownames(MO))]), assay = "chromvar", group.by = "clusters")+scale_color_gradientn(colors = c("#04578f", "gray85", "#fffb17")), row_names_gp = gpar(fontsize = 12), column_names_gp = gpar(fontsize = 16), column_names_rot = -90, row_names_rot = -0, cluster_columns =F,wid))+coord_flip()
+```
+```{r Coverage Plots unlinked}
+CoveragePlot(MO, region = "IL7R",features = "IL7R", group.by = "group", extend.downstream = 500, extend.upstream = 750, links = F)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+
+CoveragePlot(MO, region = "CCR7", features = "CCR7", group.by = "group", extend.downstream = 500, extend.upstream = 500, links = F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+
+CoveragePlot(MO, region = "FOXO1",features = "FOXO1", group.by = "group", extend.downstream = 500, extend.upstream =500 , links = F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+
+CoveragePlot(MO, region = "FOXP1", features = "FOXP1",group.by = "group", extend.downstream = 500, extend.upstream = 500, expression.assay = "SCT", links = F)&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+
+CoveragePlot(MO, region = "IKZF2", features = "IKZF2",group.by = "group", extend.downstream = 200, extend.upstream = 200, links = F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+
+
+CoveragePlot(MO, region = "ATF2", features = "ATF2",group.by = "group", extend.downstream = 100, extend.upstream = 500, links = T, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 10))
+
+
+
+CoveragePlot(MO, region = "chr2-175168382-175168384", features = "ATF2",group.by = "group", extend.downstream = 1000, extend.upstream= 1000, links = F, expression.assay = "SCT")&scale_fill_manual(values = c("Naive" = "gray75", "24hr_3/27" = "#008080", "24hr_Beads" = "Red"))&theme(text = element_text(size = 13))
+
+
+
+```
+
+#ArchR
+##to have interopo-bility (not sure how to spell) between seurat and archR objects is a tricky thing
+```{r}
+#I first make the seurat object mostly to make sure that there's QC for RNA, and I use it for RNA visualizations
+
+#I use archR for ATAC visualizations
+
+#I make sure that the same cells are used across seurat and archR objects, however the ATAC data cannot be used across objects because the peak calls are different
+
+#ArchR is tricky so reformatting fragment files is a good idea
+library(data.table)
+
+path<- file.path(DATA_DIR, "pilot_cd27/outs/atac_fragments.tsv.gz")
+#forked repo deals with formatting bug
+devtools::install_github("waltno/ArchR")
+
+#get file path to reformated fragment files
+ArchR::reformatFragmentFiles(path)
+  
+path<- file.path(DATA_DIR, "pilot_cd27/outs/atac_fragments-Reformat.tsv.gz")
+
+addArchRGenome("hg38")
+setwd(DATA_DIR)
+
+#re install regular version so createArrowFiles works :)
+devtools::install_github("GreenleafLab/ArchR")
+
+#make arrow files, these are always super big + having downloaded fragment files, that's why its nice to run everything on rhino in an interactive R session or something
+ArrowFiles <- createArrowFiles(
+  inputFiles = path,
+  sampleNames = "pilot_cd27",
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE,
+  minTSS = 2, 
+  minFrags = 1000,
+  force = T
+)
+
+
+cd27 <- ArchRProject(
+  ArrowFiles = ArrowFiles, 
+  outputDirectory = DATA_DIR,
+  copyArrows =  F#This is recommened so that if you modify the Arrow files you have an original copy for later usage
+)
+
+saveArchRProject(cd27)
+
+cd27<- loadArchRProject(DATA_DIR)
+
+#get metadata
+df<-MO@meta.data
+
+#make barcodes match archr barcodes...they're different which is annoying
+rownames(df) <- paste0("pilot_cd27#",rownames(df))
+
+##subset seurat master object to match archR
+##subset archr master object to match seurat
+cd27<-cd27[which(cd27@cellColData@rownames %in% rownames(df)),]
+df<-df[order(match(rownames(df), rownames(cd27))),]
+
+ids<- gsub("pilot_cd27#", "",cd27@cellColData@rownames)
+ids<- gsub("#", "_", ids)
+
+MO<- MO[,colnames(MO) %in% ids]
+MO@meta.data
+#transfer metadata to archR object
+df
+cd27@cellColData<-cbind(cd27@cellColData, df)
+
+#add gene expression matrix to ArchR object
+files<-file.path(DATA_DIR, "pilot_cd27/outs/raw_feature_bc_matrix.h5")
+
+file.exists(files)
+
+seRNA <- import10xFeatureMatrix(input = files, names = "pilot_cd27")
+
+cd27<-addGeneExpressionMatrix(input=cd27, seRNA=seRNA, force = T)
+
+getAvailableMatrices(cd27)
+
+saveArchRProject(cd27)
+```
+
+```{r Pairwise comparision between bead and cd27}
+Idents(MO)<-"group"
+differential.activity <- FindMarkers(
+  object = MO,
+  ident.1 = "24hr_3/27",
+  ident.2 = "24hr_Beads",
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff"
+)
+  
+  
+c<-differential.activity %>% dplyr::filter(avg_diff > 0) %>% dplyr::arrange(desc(avg_diff)) 
+c$rank <- rev(seq_len(nrow(c)))
+c$group<-"cd27"
+
+b<-differential.activity %>% dplyr::filter(avg_diff < -0.25) %>% dplyr::arrange(avg_diff)
+b$rank <- -rev(seq_len(nrow(b)))
+b$group<-"bead"
+
+
+df<-rbind(c, b)
+
+ggplot(df, aes(rank, abs(avg_diff), fill = group))+geom_point()
+
+```
+
+```{r}
+ggPDX <-ggplot(agg, aes(rank, mlog10Padj, fill = ifelse(mlog10Padj > 1, group, NA))) + 
+  geom_point(aes(size =  mlog10Padj), color = "gray20", shape = 21) +
+  geom_vline(xintercept = 0)+
+  ggrepel::geom_label_repel(
+        data = agg[agg$mlog10Padj >1,], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 3,
+        nudge_x = 5,
+        color = "black",
+        fill = "white",
+        nudge_y = 10, max.overlaps = 100
+  )+theme_ArchR()+ 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = c("gray90", "gray10"))+scale_fill_manual(values =c("Red","#008080"),na.value = "black") 
+
+
+ggPDX
+```
+
+#transfer umap coordinates
+```{r reduce dimensions}
+cd27 <- addIterativeLSI(
+    ArchRProj = cd27,
+    useMatrix = "TileMatrix", 
+    name = "ATAC_LSI", 
+    clusterParams = list(
+      resolution = 0.2, 
+      cell_lineCells = 10000,
+      n.start = 10
+    ),
+    iterations = 5, 
+    varFeatures = 10000, 
+    dimsToUse = 1:15,
+    force=T,
+    LSIMethod = 1
+)
+
+cd27 <- addUMAP(
+    ArchRProj = cd27,
+    reducedDims = "ATAC_LSI",
+    name = "ATAC_UMAP",
+    nNeighbors = 20,
+    minDist = 0.5,
+    metric = "cosine",
+    force=T
+)
+
+
+p<-plotEmbedding(ArchRProj = cd27, colorBy = "cellColData", name = "cell_line", embedding = "ATAC_UMAP", palette =  "stallion2")
+plotPDF(p, name = "ATAC_UMAP.pdf", ArchRProj = cd27, addDOC = FALSE, width = 8, height = 10)
+
+cd27 <- addIterativeLSI(
+    ArchRProj = cd27, 
+    clusterParams = list(
+      resolution = 0.2, 
+      cell_lineCells = 10000,
+      n.start = 10
+    ),
+    saveIterations = FALSE,
+    useMatrix = "GeneExpressionMatrix", 
+    depthCol = "Gex_nUMI",
+    varFeatures = 2500,
+    firstSelection = "variable",
+    binarize = FALSE,
+    name = "LSI_RNA"
+)
+
+
+cd27 <- addUMAP(
+    ArchRProj = cd27,
+    reducedDims = "LSI_RNA",
+    name = "RNA_UMAP",
+    nNeighbors = 30,
+    minDist = 0.5,
+    metric = "cosine"
+)
+
+p<-plotEmbedding(cd27, name = "cell_line", embedding = "RNA_UMAP", size = 1.5, labelAsFactors=F, labelMeans=F)
+plotPDF(p, name = "RNA_UMAP.pdf", ArchRProj = cd27, addDOC = FALSE, width = 8, height = 10)
+
+#combined RNA and ATAC DIMS to create multiome embedding
+cd27 <- addCombinedDims(cd27, reducedDims = c("LSI_RNA", "ATAC_LSI"), name =  "mo")
+
+cd27 <- addUMAP(
+    ArchRProj = cd27,
+    reducedDims = "mo",
+    name = "mo_UMAP",
+    nNeighbors = 30,
+    minDist = 0.5,
+    metric = "cosine"
+)
+
+cd27 <- addImputeWeights(cd27, reducedDims = "mo")
+```
+
+```{r call peaks}
+#Call peaks on ArchR object
+cd27@cellColData
+
+cd27 <- addGroupCoverages(ArchRProj = cd27, groupBy = "group", force = T)
+
+#if you're running on rhino make sure to ml MACS2 before launching R, if you're running locally you need to install macs2 with python..definitely less messy to run on rhino
+pathToMacs2 <- findMacs2()
+
+cd27 <- addReproduciblePeakSet(
+    ArchRProj = cd27, 
+    groupBy = "group", 
+    pathToMacs2 = pathToMacs2
+)
+
+cd27 <- addPeakMatrix(cd27)
+
+# cd27 <- addPeak2GeneLinks(
+#     ArchRProj = cd27,
+#     reducedDims = "mo",
+#     useMatrix = "GeneExpressionMatrix"
+# )
+
+saveArchRProject(cd27, outputDirectory = DATA_DIR, overwrite = T)
+```
+
+```{r ChomVAR moitf annotations}
+cd27<-loadArchRProject(DATA_DIR)
+
+
+
+cd27@peakAnnotation$Motif<-NULL
+
+
+#default annotation is cisbp :)
+cd27 <- addMotifAnnotations(ArchRProj = cd27, name = "cisbp_Motif", force = T)
+cd27 <- addBgdPeaks(cd27, force = T)
+
+cd27 <- addDeviationsMatrix(
+  ArchRProj = cd27, 
+  peakAnnotation = "cisbp_Motif",
+  force = TRUE
+)
+getAvailableMatrices(cd27)
+saveArchRProject(cd27)
+```
+
+```{r make seurat object}
+##making analogous seurat object from archR object
+ids<- cd27@cellColData@rownames 
+
+umap<- cd27@embeddings$mo_UMAP$df
+names(umap)<-c("mo_UMAP_1", "mo_UMAP_2")
+
+mo_df<-MO@reductions$wnn.umap@cell.embeddings
+rownames(mo_df)<-paste0("pilot_cd27#",rownames(mo_df) )
+
+mo_df<-mo_df[order(match(rownames(mo_df), rownames(umap))),]
+
+head(rownames(umap))
+head(rownames(mo_df))
+
+cd27@embeddings$wnn.umap<-cd27@embeddings$mo_UMAP
+cd27@embeddings$wnn.umap$df[,1]<-mo_df[,1]
+cd27@embeddings$wnn.umap$df[,2]<-mo_df[,2]
+
+plotEmbedding(cd27, embedding = "wnn.umap")
+```
+#-------------------------------------------------------------------------------------------------------------------#
+```{r Correlate MM exp wide}
+seGroupMotif <- getGroupSE(ArchRProj = cd27, useMatrix = "MotifMatrix", groupBy = "group")
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+
+seZ
+
+rowData(seZ)$maxDelta <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+
+corGSM_MM <- correlateMatrices(
+  ArchRProj = cd27,
+  useMatrix1 = "GeneExpressionMatrix",
+  useMatrix2 = "MotifMatrix",
+  reducedDims = "ATAC_LSI"
+)
+  
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*","",corGSM_MM[,"MotifMatrix_name"]))), ]
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(corGSM_MM$cor > 0.5 & corGSM_MM$padj < 0.05 )] <- "YES"
+sort(corGSM_MM[corGSM_MM$TFRegulator=="YES",1])
+
+df<-data.frame(corGSM_MM)
+
+write.csv(df, file.path("../res/tf_motif_expression_correlation_exp_wide.csv"))
+
+df<-read.csv(file.path("../res/tf_motif_expression_correlation_exp_wide.csv"))
+
+p <- ggplot(df, aes(cor, maxDelta, color = TFRegulator)) +
+  geom_point() + 
+  theme_ArchR() +
+  geom_vline(xintercept = 0, lty = "dashed") + 
+  scale_color_manual(values = c("NO"="darkgrey", "YES"="firebrick3")) +
+  xlab("Correlation To Gene Score") +
+  ylab("Max TF Motif Delta") +
+  scale_y_continuous(
+    expand = c(0,0), 
+    limits = c(0, max(df$maxDelta)*1.05)
+  )+
+  geom_text_repel(data = df[df$TFRegulator == "YES",],label = as.character(df[df$TFRegulator == "YES",]$GeneExpressionMatrix_matchName),
+                   point.padding =1,
+                   force = 3,
+                   segment.color = 'grey50',
+                   colour = "black")
+
+
+p+theme_bw()+theme(
+         panel.background = element_rect(fill='transparent'),
+         plot.background = element_rect(fill='transparent', color=NA),
+         panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         legend.background = element_rect(fill='transparent'),
+         legend.box.background = element_rect(fill='transparent')
+       )
+
+```
+
+```{r cell line specificity chromvAR}
+corr<-read.csv("../res/tf_motif_expression_correlation_exp_wide.csv")
+
+mtf_mat<-getMatrixFromProject(cd27, useMatrix = "MotifMatrix")
+mtf_seu<-CreateSeuratObject(counts = mtf_mat@assays@data$deviations, assay = "chromVAR", meta.data=data.frame(mtf_mat@colData), project = "mtf_cellLine")
+
+chrom_cell_line_avg<-AverageExpression(mtf_seu, assay ="chromVAR", group.by = "group")
+rownames(chrom_cell_line_avg[[1]])<-mtf_mat@elementMetadata$name
+
+chrom_mat <- chrom_cell_line_avg[[1]][corr[corr$TFRegulator=="YES",]$MotifMatrix_name,] %>% as.matrix()
+chrom_mat<- t(scale(t(chrom_mat)))
+library(viridis)
+
+pal<- rev(mako(n=9))
+pal<-pal[1:8]
+pal<-c("#ffffff", pal)
+quantile(chrom_mat, c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9))
+col_fun = circlize::colorRamp2(quantile(chrom_mat, c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)), pal)
+
+h1<-Heatmap(chrom_mat, name = "chromVAR",  col =col_fun, row_names_gp = gpar(fontsize = 12), column_names_gp = gpar(fontsize = 16), column_names_rot = -90, row_names_rot = -20, cluster_columns =T,width = 100, cluster_rows = T, show_column_dend = T, show_row_dend = F)
+h1
+```
+
+```{r}
+markerTest <- getMarkerFeatures(
+    ArchRProj = cd27 ,
+    useMatrix = "PeakMatrix",
+    groupBy = "group",
+    testMethod = "wilcoxon",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    useGroups ="24hr_3/27",
+    bgdGroups = "24hr_Beads"
+  )
+  
+  motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest,
+    ArchRProj = cd27,
+    peakAnnotation = "Motif",
+    cutOff = "Log2FC >= 0"
+  )
+  
+  motifsDo <- peakAnnoEnrichment(
+    seMarker = markerTest,
+    ArchRProj = cd27,
+    peakAnnotation = "Motif",
+    cutOff = "Log2FC <= 0"
+  )
+  
+  #get motifs enriched in shFLI group and rank them by mlog10Padj
+  df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+  df_1 <- df[order(df$mlog10Padj, decreasing = TRUE),]
+  df_1$rank <- rev(seq_len(nrow(df_1)))
+  df_1$group<-"cd27"
+  
+  #get motifs enriched in shNS group and rank them by mlog10Padj
+  df <- data.frame(TF = rownames(motifsDo), mlog10Padj = assay(motifsDo)[,1])
+  df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+  df$rank <- rev(seq_len(nrow(df)))
+  df$group<-"bead"
+  df$rank<- -df$rank
+  
+  #combine them together to get TF motif data on both groups
+  agg<-rbind(df_1, df)
+  
+  agg
+
+ggplot(agg, aes(y = mlog10Padj, x = rank, fill = ifelse(mlog10Padj > 2, group, NA))) + 
+  geom_point(aes(size =  mlog10Padj), color = "gray20", shape = 21) +
+  geom_vline(xintercept = 0)+
+  ggrepel::geom_label_repel(
+        data = df[df$mlog10Padj >1 ,], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 3,
+        nudge_x = 11,
+        color = "black",
+        fill = "white",
+        nudge_y = 25, max.overlaps = 100
+  )+theme_ArchR()+ 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = c("gray90", "gray10"))+scale_fill_manual(values =c("#5362e6","#272E6A"),na.value = "black") 
+```
+
+#intersect DE/DA with FigR
+```{r Top Regulators Dot Plots}
+fig.d<-read.csv(file.path(RES_DIR, "stim_figR_cd27.csv"))
+
+filt<-fig.d[fig.d$Score > abs(1.4), ]
+
+DefaultAssay(MO)<-"chromvar"
+Idents(MO)<-"group"
+differential.activity <- FindAllMarkers(
+  object = MO,
+  only.pos = T,
+  mean.fxn = rowMeans,
+  fc.name = "avg_diff"
+)
+
+t<- c()
+for(i in 1:length(differential.activity$gene)){
+  t[i]<-MO@assays$ATAC@motifs@motif.names[[differential.activity$gene[i]]]
+}
+differential.activity$TF <- t
+
+DefaultAssay(MO)<- "SCT" 
+Idents(MO)<-"group"
+
+MO.markers <- FindAllMarkers(MO, only.pos = T,  logfc.threshold = 0.25)
+
+rna_27<-MO.markers %>% dplyr::filter(cluster == "24hr_3/27") %>% rownames()
+
+mtf_27<-differential.activity %>% dplyr::filter(cluster == "24hr_3/27") %>% rownames()
+
+filt_27<-intersect(fig.d$Motif, rna_27)
+
+filt_27<-intersect(filt_27, mtf_27)
+
+p<-DotPlot(MO, assay = "SCT", features = filt_27, group.by = "group")+scale_color_gradientn(colors = c("gray85", "#04578f", "#801b1b"))+coord_flip()+labs(title = "RNA")
+
+q<-DotPlot(MO, assay = "chromvar", features = filt_27, group.by = "group")+scale_color_gradientn(colors = rev(mako(9)))+coord_flip()+labs(title = "Motif Enrichment")
+p+q
+```
+
+
+
+
+
+
